@@ -167,11 +167,36 @@ const AICareerAssistant: React.FC = () => {
       if (data.contextId) {
         setContextId(data.contextId);
         setResumeScore(typeof data.score === "number" ? data.score : null);
+        const strengths: string[] = Array.isArray(data.strengths)
+          ? data.strengths
+          : [];
+        const improvements: string[] = Array.isArray(data.improvements)
+          ? data.improvements
+          : [];
+        const report = data.report || null;
+
+        const reportLines: string[] = [
+          `Resume uploaded. Score: ${data.score}/100.`,
+          report?.overall_score !== undefined
+            ? `Overall Report Score: ${report.overall_score}/10`
+            : "",
+          report?.ats_score !== undefined
+            ? `ATS Score: ${report.ats_score}%`
+            : "",
+          strengths.length ? "\nStrengths:" : "",
+          ...strengths.map((s: string) => `- ${s}`),
+          improvements.length ? "\nImprovements:" : "",
+          ...improvements.map((s: string) => `- ${s}`),
+          "\nYou can now ask questions and get tailored advice based on your resume.",
+        ].filter(Boolean);
+
+        const reportMessage = reportLines.join("\n");
+
         setMessages((prev) => [
           ...prev,
           {
             id: Date.now().toString(),
-            content: `Resume uploaded. Score: ${data.score}/100. You can now ask questions and get tailored advice.`,
+            content: reportMessage,
             sender: "ai",
             timestamp: new Date(),
           },

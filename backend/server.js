@@ -4,7 +4,10 @@ import dotenv from "dotenv";
 import multer from "multer";
 import fs from "fs";
 import path from "path";
+import Tesseract from "tesseract.js";
 import { GoogleGenerativeAI } from "@google/generative-ai";
+import os from "os";
+import { execFile } from "child_process";
 
 dotenv.config();
 
@@ -31,8 +34,43 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "");
+const sanitizedKey = (process.env.GEMINI_API_KEY || "")
+  .replace(/^\"|\"$/g, "")
+  .replace(/^'|'$/g, "");
+const genAI = new GoogleGenerativeAI(sanitizedKey);
 const model = () => genAI.getGenerativeModel({ model: "gemini-2.5-pro" });
+
+async function extractTextWithGeminiImage(filePath) {
+  try {
+    if (!process.env.GEMINI_API_KEY) return "";
+    const ext = path.extname(filePath).toLowerCase();
+    const mimeType =
+      ext === ".png"
+        ? "image/png"
+        : ext === ".jpg" || ext === ".jpeg"
+        ? "image/jpeg"
+        : ext === ".webp"
+        ? "image/webp"
+        : "application/octet-stream";
+    const bytes = fs.readFileSync(filePath);
+    const base64 = Buffer.from(bytes).toString("base64");
+    const prompt =
+      "Extract all clearly readable text from this resume image. Return ONLY the text, no extra commentary.";
+    const res = await model().generateContent({
+      contents: [
+        {
+          role: "user",
+          parts: [{ text: prompt }, { inlineData: { data: base64, mimeType } }],
+        },
+      ],
+    });
+    const txt = res.response.text() || "";
+    return txt.trim();
+  } catch (e) {
+    console.warn("Gemini image OCR failed:", e?.message || e);
+    return "";
+  }
+}
 
 function scoreResume(text) {
   const signals = {
@@ -50,7 +88,87 @@ function scoreResume(text) {
   };
   const total = Object.values(signals).reduce((a, b) => a + b, 0);
   const score = Math.round((total / 5) * 100);
-  return { score, signals };
+
+  const strengths = [];
+  const improvements = [];
+
+  if (signals.projects) strengths.push("Shows projects built or developed");
+  else improvements.push("Add 1–2 impact-driven projects with metrics");
+
+  if (signals.internships)
+    strengths.push("Includes internship/industry exposure");
+  else improvements.push("Pursue internships or add practical experience");
+
+  if (signals.impact) strengths.push("Uses quantified impact and action verbs");
+  else improvements.push("Quantify outcomes (%, time saved, revenue, users)");
+
+  if (signals.leadership)
+    strengths.push("Demonstrates leadership or ownership");
+  else improvements.push("Highlight leadership, ownership, or initiatives");
+
+  if (signals.skills) strengths.push("Lists in-demand technical skills");
+  else
+    improvements.push("Add relevant technical skills aligned to target roles");
+
+  return { score, signals, strengths, improvements };
+}
+
+async function scoreResumeWithGemini(resumeText) {
+  if (!process.env.GEMINI_API_KEY) {
+    return null;
+  }
+  const scoringPrompt = `You are an expert technical recruiter. Read the resume text below and return a strict JSON object assessing candidate readiness for software/tech roles.
+
+Rules:
+- Output ONLY valid JSON. No backticks. No commentary.
+- JSON shape:
+  {
+    "score": number,            // integer from 0 to 100
+    "strengths": string[],      // 3-6 short bullets
+    "improvements": string[]    // 3-6 short bullets
+  }
+- Weigh: technical skills depth, projects impact, internships/experience, quantified achievements, leadership/community, clarity.
+
+Resume:
+"""
+${resumeText.slice(0, 12000)}
+"""`;
+
+  try {
+    const res = await model().generateContent({
+      contents: [
+        {
+          role: "user",
+          parts: [{ text: scoringPrompt }],
+        },
+      ],
+    });
+    const txt = res.response.text();
+    const firstBrace = txt.indexOf("{");
+    const lastBrace = txt.lastIndexOf("}");
+    const jsonSlice =
+      firstBrace >= 0 && lastBrace >= 0
+        ? txt.slice(firstBrace, lastBrace + 1)
+        : txt;
+    const parsed = JSON.parse(jsonSlice);
+    if (typeof parsed.score === "number") {
+      // Clamp
+      parsed.score = Math.max(0, Math.min(100, Math.round(parsed.score)));
+      parsed.strengths = Array.isArray(parsed.strengths)
+        ? parsed.strengths
+        : [];
+      parsed.improvements = Array.isArray(parsed.improvements)
+        ? parsed.improvements
+        : [];
+      return parsed;
+    }
+  } catch (e) {
+    console.warn(
+      "Gemini scoring failed, using heuristic fallback:",
+      e?.message || e
+    );
+  }
+  return null;
 }
 
 function buildSystemPrompt(resumeText, scoreObj) {
@@ -70,21 +188,97 @@ app.post("/api/upload-resume", upload.single("file"), async (req, res) => {
     let extractedText = "";
 
     if (ext === ".pdf") {
+      // Primary: use pdftotext CLI
       try {
-        const { default: pdfParse } = await import("pdf-parse");
-        const pdfData = await pdfParse(fs.readFileSync(filePath));
-        extractedText = pdfData.text || "";
+        extractedText = await new Promise((resolve, reject) => {
+          execFile(
+            "pdftotext",
+            ["-layout", filePath, "-"],
+            { maxBuffer: 20 * 1024 * 1024 },
+            (err, stdout) => (err ? reject(err) : resolve(stdout || ""))
+          );
+        });
       } catch (e) {
-        console.warn("PDF parse failed, falling back to placeholder context:", e?.message || e);
-        extractedText = `PDF resume uploaded: ${path.basename(
-          filePath
-        )}. If text extraction is incomplete, ask the user to paste education, projects, and skills.`;
+        console.warn("pdftotext not available or failed:", e?.message || e);
+        extractedText = "";
+      }
+
+      // Fallback: OCR via pdftoppm + tesseract.js (force with ENABLE_PDF_OCR=force)
+      if (
+        (process.env.ENABLE_PDF_OCR === "force" ||
+          (extractedText || "").trim().length < 200) &&
+        process.env.ENABLE_PDF_OCR !== "false"
+      ) {
+        try {
+          const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pdfocr-"));
+          const outPrefix = path.join(tmpDir, "page");
+          await new Promise((resolve, reject) => {
+            execFile(
+              "pdftoppm",
+              ["-png", filePath, outPrefix],
+              { maxBuffer: 20 * 1024 * 1024 },
+              (err) => (err ? reject(err) : resolve(undefined))
+            );
+          });
+          const images = fs
+            .readdirSync(tmpDir)
+            .filter((f) => /page-\d+\.png$/i.test(f))
+            .map((f) => path.join(tmpDir, f));
+          let ocrText = "";
+          for (const img of images) {
+            try {
+              const ocr = await Tesseract.recognize(img, "eng", {
+                logger: () => {},
+              });
+              if (ocr?.data?.text) ocrText += "\n" + ocr.data.text;
+            } catch {}
+          }
+          if (
+            process.env.ENABLE_PDF_OCR === "force"
+              ? ocrText.trim().length > 0
+              : ocrText.trim().length > (extractedText || "").trim().length
+          ) {
+            extractedText = ocrText;
+          }
+          // Cleanup temp images
+          try {
+            for (const img of images) fs.unlinkSync(img);
+            fs.rmdirSync(tmpDir);
+          } catch {}
+        } catch (e) {
+          console.warn(
+            "PDF OCR fallback failed or pdftoppm not available:",
+            e?.message || e
+          );
+        }
       }
     } else if ([".png", ".jpg", ".jpeg", ".webp"].includes(ext)) {
-      // Basic fallback: store note; real OCR could be added later.
-      extractedText = `Image resume uploaded: ${path.basename(
-        filePath
-      )}. Ask user to confirm key details (education, projects, skills).`;
+      try {
+        const ocr = await Tesseract.recognize(filePath, "eng", {
+          logger: () => {},
+        });
+        extractedText = ocr.data && ocr.data.text ? ocr.data.text : "";
+      } catch (e) {
+        console.warn(
+          "OCR failed; extracted text will be empty:",
+          e?.message || e
+        );
+        extractedText = "";
+      }
+
+      // Gemini Vision OCR fallback when Tesseract is weak
+      if (
+        (extractedText || "").trim().length < 100 &&
+        process.env.GEMINI_API_KEY
+      ) {
+        const visionText = await extractTextWithGeminiImage(filePath);
+        if (
+          visionText &&
+          visionText.trim().length > (extractedText || "").trim().length
+        ) {
+          extractedText = visionText;
+        }
+      }
     } else {
       // Try reading as text
       try {
@@ -100,7 +294,119 @@ app.post("/api/upload-resume", upload.single("file"), async (req, res) => {
     );
     fs.writeFileSync(extractedPath, extractedText, "utf8");
 
-    const scoreObj = scoreResume(extractedText);
+    // Deterministic text-only scoring and report (no LLM at upload time)
+    const heuristic = scoreResume(extractedText);
+    const scoreObj = heuristic;
+
+    function analyzeResume(text) {
+      const lower = (text || "").toLowerCase();
+      const has = (re) => re.test(text);
+      const count = (re) => (lower.match(re) || []).length;
+
+      const sectionPresence = {
+        contact_info: /(email|phone|linkedin|github)\b/i.test(text),
+        summary: /(summary|objective)\b/i.test(text),
+        experience: /(experience|work experience|employment)\b/i.test(text),
+        education: /(education|b\.tech|btech|bachelor|master|b\.e\.)\b/i.test(
+          text
+        ),
+        skills: /(skills|technologies|technical skills)\b/i.test(text),
+        projects: /(projects|project)\b/i.test(text),
+        certifications: /(certification|certificate)\b/i.test(text),
+      };
+
+      const sectionScores = {
+        contact_info: sectionPresence.contact_info ? 9 : 4,
+        summary: sectionPresence.summary ? 7 : 4,
+        experience: sectionPresence.experience ? 8 : 3,
+        education: sectionPresence.education ? 9 : 5,
+        skills: sectionPresence.skills ? 8 : 4,
+        projects: sectionPresence.projects ? 8 : 3,
+        certifications: sectionPresence.certifications ? 6 : 4,
+      };
+
+      const keywordList = [
+        "react",
+        "node",
+        "typescript",
+        "javascript",
+        "python",
+        "java",
+        "aws",
+        "docker",
+        "kubernetes",
+        "sql",
+        "mongodb",
+        "postgres",
+        "ml",
+        "ai",
+        "data structures",
+        "algorithms",
+        "rest",
+        "graphql",
+      ];
+
+      const keyword_density = Object.fromEntries(
+        keywordList.map((k) => [
+          k,
+          count(
+            new RegExp(
+              `\\b${k.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&")}\\b`,
+              "g"
+            )
+          ),
+        ])
+      );
+
+      const quantified =
+        /(\d+%|percent|\\b\d+\\s*(users|ms|sec|minutes|hours|x|times|issues|tickets|revenue|sales))\b/i.test(
+          text
+        );
+
+      const strengths = [...(scoreObj.strengths || [])];
+      const improvements = [...(scoreObj.improvements || [])];
+      if (quantified) strengths.push("Uses numbers/metrics to show impact");
+      else
+        improvements.push(
+          "Add quantified impact (%, time saved, users, revenue)"
+        );
+      if (sectionPresence.projects) strengths.push("Has a projects section");
+      else
+        improvements.push(
+          "Add a projects section with 2–3 concise bullets each"
+        );
+      if (sectionPresence.skills) strengths.push("Includes a skills section");
+      else improvements.push("Add a concise, role-aligned skills section");
+
+      const atsSignals = [
+        sectionPresence.skills,
+        sectionPresence.experience,
+        sectionPresence.education,
+        Object.values(keyword_density).some((v) => v > 0),
+        quantified,
+      ];
+      const ats_score = Math.round(
+        (atsSignals.reduce((a, b) => a + (b ? 1 : 0), 0) / atsSignals.length) *
+          100
+      );
+
+      const overall_score = Math.round(
+        (Object.values(sectionScores).reduce((a, b) => a + b, 0) /
+          (Object.values(sectionScores).length * 10)) *
+          10
+      );
+
+      return {
+        overall_score,
+        sections: sectionScores,
+        ats_score,
+        keyword_density,
+        strengths,
+        improvements,
+      };
+    }
+
+    const report = analyzeResume(extractedText);
 
     // Persist a conversation context file
     const context = {
@@ -108,6 +414,7 @@ app.post("/api/upload-resume", upload.single("file"), async (req, res) => {
       extractedFile: path.basename(extractedPath),
       extractedTextLength: extractedText.length,
       score: scoreObj,
+      report,
       createdAt: new Date().toISOString(),
     };
     const contextId = path.basename(filePath);
@@ -120,6 +427,9 @@ app.post("/api/upload-resume", upload.single("file"), async (req, res) => {
       contextId,
       score: scoreObj.score,
       signals: scoreObj.signals,
+      strengths: report.strengths || [],
+      improvements: report.improvements || [],
+      report,
     });
   } catch (err) {
     console.error(err);
@@ -161,9 +471,14 @@ Relevant resume excerpt (may be empty):\n\n${resumeText.slice(
       });
     }
 
-    const result = await model().generateContent([
-      { role: "user", parts: [{ text: systemPrompt + "\n\n" + userPrompt }] },
-    ]);
+    const result = await model().generateContent({
+      contents: [
+        {
+          role: "user",
+          parts: [{ text: systemPrompt + "\n\n" + userPrompt }],
+        },
+      ],
+    });
     const text = result.response.text();
     res.json({ reply: text });
   } catch (err) {
